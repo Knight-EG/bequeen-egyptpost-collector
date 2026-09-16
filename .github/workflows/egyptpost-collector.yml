@@ -1,32 +1,34 @@
 name: BeQueen Egypt Post Collector
-
 on:
   workflow_dispatch:
   schedule:
-    # Every 3 hours, away from the top of the hour to reduce schedule congestion.
     - cron: '17 */3 * * *'
-
 concurrency:
   group: bequeen-egyptpost-collector
   cancel-in-progress: false
-
 jobs:
   collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
-          node-version: '22'
+          node-version: 22
+          package-manager-cache: false
       - run: npm install
       - run: npx playwright install chromium --with-deps
       - name: Collect Egypt Post tracking
-        run: npm run collect
         env:
           BEQUEEN_WP_BASE: ${{ secrets.BEQUEEN_WP_BASE }}
           BEQUEEN_COLLECTOR_KEY: ${{ secrets.BEQUEEN_COLLECTOR_KEY }}
-          BEQUEEN_BATCH_LIMIT: '100'
-          BEQUEEN_DELAY_MS: '2000'
-          BEQUEEN_REQUEST_TIMEOUT_MS: '60000'
-          BEQUEEN_MAX_ATTEMPTS: '3'
+        run: npm run collect
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: egyptpost-debug-${{ github.run_number }}
+          path: |
+            egyptpost-debug.png
+            egyptpost-debug.html
+          if-no-files-found: ignore
+          retention-days: 7
