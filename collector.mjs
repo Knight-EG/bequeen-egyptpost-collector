@@ -1,93 +1,262 @@
 import { chromium } from 'playwright';
+import fs from 'node:fs/promises';
 
 const WP_BASE = (process.env.BEQUEEN_WP_BASE || '').replace(/\/$/, '');
-const KEY = process.env.BEQUEEN_COLLECTOR_KEY || '';
-const LIMIT = Number(process.env.BEQUEEN_BATCH_LIMIT || 100);
-const DELAY_MS = Number(process.env.BEQUEEN_DELAY_MS || 2000);
-const REQUEST_TIMEOUT_MS = Number(process.env.BEQUEEN_REQUEST_TIMEOUT_MS || 60000);
-const MAX_ATTEMPTS = Number(process.env.BEQUEEN_MAX_ATTEMPTS || 3);
-const TRACK_PAGE = 'https://egyptpost.gov.eg/ar-eg/home/eservices/track-and-trace/';
+const COLLECTOR_KEY = process.env.BEQUEEN_COLLECTOR_KEY || '';
 
-if (!WP_BASE || !KEY) throw new Error('Missing BEQUEEN_WP_BASE or BEQUEEN_COLLECTOR_KEY');
-const headers = {'X-BeQueen-Collector-Key': KEY, 'Content-Type': 'application/json'};
+const TRACK_PAGE = 'https://egyptpost.gov.eg/ar-eg/home/eservices/track-and-trace/';
+const PROBE_BARCODE = 'ENO25400471EG';
+const SESSION_TIMEOUT_MS = 120_000;
+const REQUEST_TIMEOUT_MS = 60_000;
+const BETWEEN_REQUESTS_MS = 2_000;
+const MAX_ATTEMPTS = 3;
+
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-async function wpJson(url, options={}) {
-  const r = await fetch(url, {...options, headers: {...headers, ...(options.headers||{})}});
-  const text = await r.text();
-  if (!r.ok) throw new Error(`WordPress HTTP ${r.status}: ${text.slice(0,500)}`);
-  try { return JSON.parse(text); } catch { throw new Error(`WordPress returned non-JSON: ${text.slice(0,500)}`); }
+async function saveDebug(page, prefix = 'egyptpost-debug') {
+  try { await page.screenshot({ path: `${prefix}.png`, fullPage: true }); } catch {}
+  try { await fs.writeFile(`${prefix}.html`, await page.content(), 'utf8'); } catch {}
+}
+
+async function probe(page, barcode = PROBE_BARCODE) {
+  return await page.evaluate(async ({ barcode, timeoutMs }) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const r = await fetch(
+        `/ar-EG/TrackTrace/GetShipmentDetails?barcode=${encodeURIComponent(barcode)}`,
+        {
+          method: 'GET',
+          credentials: 'include',
+          headers: { 'Accept': 'application/json, text/plain, */*' },
+          signal: controller.signal
+        }
+      );
+      const body = await r.text();
+      let json = null;
+      try { json = JSON.parse(body); } catch {}
+      return {
+        ok: true,
+        http: r.status,
+        cfMitigated: r.headers.get('cf-mitigated'),
+        contentType: r.headers.get('content-type'),
+        jsonSuccess: json?.success ?? null,
+        jsonCase: json?.data?.case ?? null,
+        eventCount: Array.isArray(json?.data?.data) ? json.data.data.length : null,
+        bodyPreview: body.slice(0, 500)
+      };
+    } catch (e) {
+      return { ok: false, error: String(e) };
+    } finally {
+      clearTimeout(timer);
+    }
+  }, { barcode, timeoutMs: REQUEST_TIMEOUT_MS });
 }
 
 async function waitForUsablePage(page) {
-  await page.goto(TRACK_PAGE, {waitUntil:'domcontentloaded', timeout:60000});
-  const deadline = Date.now() + 60000;
-  while (Date.now() < deadline) {
-    const probe = await page.evaluate(async () => {
-      try {
-        const r = await fetch('/ar-EG/TrackTrace/GetShipmentDetails?barcode=ENO25400471EG', {credentials:'include', headers:{Accept:'application/json, text/plain, */*'}});
-        return {status:r.status, cf:r.headers.get('cf-mitigated'), type:r.headers.get('content-type')||''};
-      } catch (e) { return {error:String(e)}; }
-    });
-    if (probe.status === 200 && !probe.cf && probe.type.includes('application/json')) return;
-    await sleep(2500);
-  }
-  throw new Error('Egypt Post browser session did not become usable within 60s');
-}
-
-async function fetchOne(page, tracking) {
-  let lastError = '';
-  for (let attempt=1; attempt<=MAX_ATTEMPTS; attempt++) {
-    const started = Date.now();
-    try {
-      const result = await page.evaluate(async ({tracking, timeout}) => {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), timeout);
-        try {
-          const r = await fetch(`/ar-EG/TrackTrace/GetShipmentDetails?barcode=${encodeURIComponent(tracking)}`, {
-            method:'GET', credentials:'include', signal:controller.signal,
-            headers:{Accept:'application/json, text/plain, */*'}
-          });
-          const text = await r.text();
-          let raw=null; try { raw=JSON.parse(text); } catch {}
-          return {http_status:r.status, cf_mitigated:r.headers.get('cf-mitigated'), content_type:r.headers.get('content-type'), raw, body_preview:text.slice(0,500)};
-        } finally { clearTimeout(timer); }
-      }, {tracking, timeout:REQUEST_TIMEOUT_MS});
-
-      if (result.http_status === 200 && !result.cf_mitigated && result.raw?.success === true) {
-        return {tracking_number:tracking, ok:true, attempts:attempt, elapsed_ms:Date.now()-started, collected_at:new Date().toISOString(), raw:result.raw};
-      }
-      lastError = `HTTP=${result.http_status} CF=${result.cf_mitigated||'null'} success=${result.raw?.success ?? 'n/a'} body=${result.body_preview||''}`;
-    } catch (e) { lastError = String(e?.message || e); }
-    if (attempt < MAX_ATTEMPTS) await sleep(2000 * attempt);
-  }
-  return {tracking_number:tracking, ok:false, attempts:MAX_ATTEMPTS, collected_at:new Date().toISOString(), error:lastError};
-}
-
-const browser = await chromium.launch({headless:true});
-try {
-  const context = await browser.newContext({locale:'ar-EG'});
-  const page = await context.newPage();
   console.log('Opening Egypt Post and waiting for a usable browser session...');
-  await waitForUsablePage(page);
-  console.log('Browser session ready.');
+  const nav = await page.goto(TRACK_PAGE, {
+    waitUntil: 'domcontentloaded',
+    timeout: 60_000
+  }).catch(e => {
+    console.log('Navigation error:', e.message);
+    return null;
+  });
 
-  const active = await wpJson(`${WP_BASE}/wp-json/bequeen-app/v1/collector/shipments?limit=${LIMIT}`);
-  console.log(`Active due shipments: ${active.count}`);
-  if (!active.shipments?.length) process.exitCode = 0;
-  else {
-    const results=[];
-    for (let i=0;i<active.shipments.length;i++) {
-      const sh=active.shipments[i];
-      console.log(`[${i+1}/${active.shipments.length}] ${sh.tracking_number}`);
-      const r=await fetchOne(page, sh.tracking_number);
-      r.order_id=Number(sh.order_id)||null;
-      results.push(r);
-      console.log(r.ok ? `  OK attempts=${r.attempts} ${r.elapsed_ms}ms` : `  ERROR ${r.error}`);
-      if(i<active.shipments.length-1) await sleep(DELAY_MS);
+  console.log('Navigation HTTP:', nav?.status() ?? 'n/a');
+
+  const started = Date.now();
+  let attempt = 0;
+
+  while (Date.now() - started < SESSION_TIMEOUT_MS) {
+    attempt++;
+    const title = await page.title().catch(() => '');
+    console.log(`\n[session probe ${attempt}] elapsed=${Math.round((Date.now()-started)/1000)}s`);
+    console.log('URL:', page.url());
+    console.log('TITLE:', title);
+
+    const result = await probe(page);
+    console.log('PROBE:', JSON.stringify(result, null, 2));
+
+    const contentType = String(result.contentType || '').toLowerCase();
+    if (
+      result.ok &&
+      result.http === 200 &&
+      !result.cfMitigated &&
+      contentType.includes('application/json') &&
+      result.jsonSuccess === true
+    ) {
+      console.log('Egypt Post browser session is usable.');
+      return;
     }
-    const pushed=await wpJson(`${WP_BASE}/wp-json/bequeen-app/v1/collector/results`, {method:'POST', body:JSON.stringify({collector:'github-playwright', run_id:process.env.GITHUB_RUN_ID||null, results})});
-    console.log('WordPress:', pushed);
-    if (pushed.errors?.length) process.exitCode=1;
+
+    await sleep(5_000);
   }
-} finally { await browser.close(); }
+
+  await saveDebug(page);
+  throw new Error(
+    `Egypt Post browser session did not become usable within ${SESSION_TIMEOUT_MS / 1000}s. ` +
+    `Debug files saved as egyptpost-debug.png/html`
+  );
+}
+
+async function wpFetch(path, options = {}) {
+  if (!WP_BASE || !COLLECTOR_KEY) {
+    throw new Error('Missing BEQUEEN_WP_BASE or BEQUEEN_COLLECTOR_KEY');
+  }
+  const r = await fetch(`${WP_BASE}${path}`, {
+    ...options,
+    headers: {
+      'Accept': 'application/json',
+      'X-BeQueen-Collector-Key': COLLECTOR_KEY,
+      ...(options.body ? { 'Content-Type': 'application/json' } : {}),
+      ...(options.headers || {})
+    }
+  });
+  const text = await r.text();
+  let json;
+  try { json = JSON.parse(text); } catch {
+    throw new Error(`WordPress returned HTTP ${r.status}: ${text.slice(0, 500)}`);
+  }
+  if (!r.ok) throw new Error(`WordPress returned HTTP ${r.status}: ${JSON.stringify(json)}`);
+  return json;
+}
+
+async function fetchTracking(page, barcode) {
+  let last;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const started = Date.now();
+    last = await probe(page, barcode);
+    last.elapsed_ms = Date.now() - started;
+    last.attempt = attempt;
+
+    if (
+      last.ok &&
+      last.http === 200 &&
+      !last.cfMitigated &&
+      String(last.contentType || '').toLowerCase().includes('application/json')
+    ) {
+      let parsed;
+      try { parsed = JSON.parse(last.bodyPreview); } catch {}
+
+      // Re-fetch full JSON because diagnostic preview is intentionally truncated.
+      const full = await page.evaluate(async ({ barcode, timeoutMs }) => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+        try {
+          const r = await fetch(
+            `/ar-EG/TrackTrace/GetShipmentDetails?barcode=${encodeURIComponent(barcode)}`,
+            {
+              credentials: 'include',
+              headers: { 'Accept': 'application/json, text/plain, */*' },
+              signal: controller.signal
+            }
+          );
+          const text = await r.text();
+          let json = null;
+          try { json = JSON.parse(text); } catch {}
+          return {
+            http: r.status,
+            cfMitigated: r.headers.get('cf-mitigated'),
+            contentType: r.headers.get('content-type'),
+            json
+          };
+        } finally { clearTimeout(timer); }
+      }, { barcode, timeoutMs: REQUEST_TIMEOUT_MS });
+
+      if (full.http === 200 && !full.cfMitigated && full.json?.success === true) {
+        return { success: true, raw: full.json, attempt, elapsed_ms: last.elapsed_ms };
+      }
+
+      // case=3/empty events can still be a valid provider response.
+      if (
+        full.http === 200 &&
+        !full.cfMitigated &&
+        full.json?.success === true &&
+        full.json?.data?.case === 3
+      ) {
+        return { success: true, raw: full.json, attempt, elapsed_ms: last.elapsed_ms };
+      }
+
+      last.full = full;
+    }
+
+    console.log(`Attempt ${attempt}/${MAX_ATTEMPTS} failed for ${barcode}:`, JSON.stringify(last));
+    if (attempt < MAX_ATTEMPTS) await sleep(attempt === 1 ? 5_000 : 15_000);
+  }
+  return { success: false, error: last };
+}
+
+const browser = await chromium.launch({
+  headless: true
+});
+
+const context = await browser.newContext({
+  locale: 'ar-EG',
+  viewport: { width: 1365, height: 900 }
+});
+
+const page = await context.newPage();
+
+try {
+  await waitForUsablePage(page);
+
+  console.log('\nRequesting active shipments from WordPress...');
+  const active = await wpFetch('/wp-json/bequeen-app/v1/collector/shipments');
+  const shipments = Array.isArray(active?.shipments) ? active.shipments : [];
+  console.log(`Active shipments returned by WordPress: ${shipments.length}`);
+
+  if (!shipments.length) {
+    console.log('Nothing is due for collection.');
+    process.exitCode = 0;
+  } else {
+    const results = [];
+
+    for (let i = 0; i < shipments.length; i++) {
+      const s = shipments[i];
+      const barcode = String(s.tracking_number || '').trim();
+      if (!barcode) continue;
+
+      console.log(`\n[${i + 1}/${shipments.length}] ${barcode}`);
+      const collectedAt = new Date().toISOString();
+      const got = await fetchTracking(page, barcode);
+
+      if (got.success) {
+        const events = Array.isArray(got.raw?.data?.data) ? got.raw.data.data.length : 0;
+        console.log(`OK ${barcode} | events=${events} | attempt=${got.attempt}`);
+        results.push({
+          order_id: s.order_id,
+          tracking_number: barcode,
+          collected_at: collectedAt,
+          success: true,
+          raw: got.raw
+        });
+      } else {
+        console.log(`FAILED ${barcode}; preserving last good WordPress state.`);
+        results.push({
+          order_id: s.order_id,
+          tracking_number: barcode,
+          collected_at: collectedAt,
+          success: false,
+          error: typeof got.error === 'string' ? got.error : JSON.stringify(got.error)
+        });
+      }
+
+      if (i < shipments.length - 1) await sleep(BETWEEN_REQUESTS_MS);
+    }
+
+    console.log(`\nPosting ${results.length} result(s) to WordPress...`);
+    const saved = await wpFetch('/wp-json/bequeen-app/v1/collector/results', {
+      method: 'POST',
+      body: JSON.stringify({ results })
+    });
+    console.log('WordPress response:', JSON.stringify(saved, null, 2));
+  }
+} catch (e) {
+  console.error('\nCOLLECTOR FATAL ERROR:', e);
+  await saveDebug(page);
+  process.exitCode = 1;
+} finally {
+  await context.close().catch(() => {});
+  await browser.close().catch(() => {});
+}
